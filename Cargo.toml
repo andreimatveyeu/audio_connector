@@ -1,0 +1,31 @@
+[package]
+name = "audio-connector"
+# Placeholder: the real version is stamped from the git tag at release time
+# (see .github/workflows/release.yml). Not hardcoded here.
+version = "0.0.0"
+edition = "2021"
+description = "JACK graph watcher that keeps a declarative TOML connection map applied"
+license = "MIT"
+repository = "https://github.com/andreimatveyeu/audio_connector"
+
+[[bin]]
+name = "audio-connector"
+path = "src/main.rs"
+
+[dependencies]
+# `dynamic_loading` (default) makes the jack crate dlopen libjack at runtime, so
+# libjack is only needed at *run* time, not for linking at build time.
+jack = "0.13"
+toml = "0.8"
+regex = "1"
+log = "0.4"
+env_logger = "0.11"
+signal-hook = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 2
+lto = true
+strip = true
