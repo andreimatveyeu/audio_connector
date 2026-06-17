@@ -172,7 +172,7 @@ fn main() {
     // Initial reconcile on startup, before the first graph event.
     reconcile(active.as_client(), &settings.config_path);
 
-    // Watch loop: wait -> clear -> debounce -> apply -> cooldown -> clear.
+    // Watch loop: wait -> debounce -> reconcile to a fixpoint.
     loop {
         dirty.wait_and_clear();
         if stop.load(Ordering::Relaxed) {
@@ -180,10 +180,29 @@ fn main() {
         }
 
         std::thread::sleep(settings.debounce);
-        reconcile(active.as_client(), &settings.config_path);
-        std::thread::sleep(settings.cooldown);
-        // Discard the events our own connections just generated.
-        dirty.clear();
+
+        // Reconcile until a pass makes no changes (the graph matches the map).
+        //
+        // Each pass that *does* change something emits graph events for our own
+        // connects/disconnects; we clear those echoes and re-check after a short
+        // cooldown. Crucially, the final (no-op) pass is NOT followed by a clear:
+        // a genuine external change made during the cooldown -- e.g. the session
+        // manager re-establishing a default-sink link we just removed -- surfaces
+        // as more work on the next pass, or, if it arrives after we've settled,
+        // leaves `dirty` set so the `wait_and_clear` above picks it up. Reconcile
+        // reads the live graph fresh every pass, so clearing the flag between
+        // passes never loses state. This is what stops the old unconditional
+        // post-cooldown `dirty.clear()` from swallowing real events (a re-linked
+        // Firefox -> hardware playback) that landed inside the cooldown window.
+        while reconcile(active.as_client(), &settings.config_path) {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(settings.cooldown);
+            // Discard the events our own connections just generated; the next
+            // pass re-derives desired state from the live graph regardless.
+            dirty.clear();
+        }
     }
 
     log::info!("shutting down");
@@ -193,17 +212,21 @@ fn main() {
 }
 
 /// Load the config and apply the declared connections to the live graph.
-fn reconcile(client: &jack::Client, config_path: &std::path::Path) {
+///
+/// Returns `true` if it changed the graph (made at least one connect or
+/// disconnect), so the caller can keep reconciling until a pass is a no-op.
+fn reconcile(client: &jack::Client, config_path: &std::path::Path) -> bool {
     log::info!("applying connections from {}", config_path.display());
     let config = match config::load_config(config_path) {
         Ok(c) => c,
         Err(e) => {
             log::error!("failed to load config: {e}");
-            return;
+            return false;
         }
     };
-    apply(client, &config);
+    let changed = apply(client, &config);
     log::info!("connections applied");
+    changed
 }
 
 /// Resolve declared edges against current ports and connect/disconnect as needed.
@@ -211,7 +234,7 @@ fn reconcile(client: &jack::Client, config_path: &std::path::Path) {
 ///   * table key  = source (output) port short-name, optionally `disconnect:`-
 ///     or `regex:`-prefixed;
 ///   * array value = destination (input) port full-names, optionally `regex:`.
-fn apply(client: &jack::Client, config: &Table) {
+fn apply(client: &jack::Client, config: &Table) -> bool {
     // Snapshot of every current port name; regex specs match against these.
     let all_ports: Vec<String> = client.ports(None, None, jack::PortFlags::empty());
     let port_set: HashSet<&str> = all_ports.iter().map(String::as_str).collect();
@@ -219,6 +242,9 @@ fn apply(client: &jack::Client, config: &Table) {
     // Lazily-built cache of each source port's existing connections, so repeated
     // declarations and the disconnect check don't re-query JACK each time.
     let mut conns: HashMap<String, HashSet<String>> = HashMap::new();
+
+    // Whether this pass actually mutated the graph.
+    let mut changed = false;
 
     for (client_name, port_map) in config {
         let Value::Table(port_map) = port_map else {
@@ -258,16 +284,18 @@ fn apply(client: &jack::Client, config: &Table) {
                         continue;
                     }
                     for dst in &input_ports {
-                        if is_disconnect {
-                            try_disconnect(client, out, dst, &mut conns);
+                        changed |= if is_disconnect {
+                            try_disconnect(client, out, dst, &mut conns)
                         } else {
-                            try_connect(client, out, dst, &mut conns);
-                        }
+                            try_connect(client, out, dst, &mut conns)
+                        };
                     }
                 }
             }
         }
     }
+
+    changed
 }
 
 /// Resolve a port spec to concrete current port names.
@@ -338,39 +366,49 @@ fn source_conns<'a>(
     })
 }
 
+/// Returns `true` if it actually established a new connection.
 fn try_connect(
     client: &jack::Client,
     source: &str,
     dest: &str,
     conns: &mut HashMap<String, HashSet<String>>,
-) {
+) -> bool {
     if source_conns(client, conns, source).contains(dest) {
-        return; // already established
+        return false; // already established
     }
     match client.connect_ports_by_name(source, dest) {
         Ok(()) => {
             log::info!("connected {source} -> {dest}");
             source_conns(client, conns, source).insert(dest.to_string());
+            true
         }
-        Err(e) => log::warn!("connect {source} -> {dest} failed: {e}"),
+        Err(e) => {
+            log::warn!("connect {source} -> {dest} failed: {e}");
+            false
+        }
     }
 }
 
+/// Returns `true` if it actually removed an existing connection.
 fn try_disconnect(
     client: &jack::Client,
     source: &str,
     dest: &str,
     conns: &mut HashMap<String, HashSet<String>>,
-) {
+) -> bool {
     if !source_conns(client, conns, source).contains(dest) {
-        return; // nothing to disconnect
+        return false; // nothing to disconnect
     }
     match client.disconnect_ports_by_name(source, dest) {
         Ok(()) => {
             log::info!("disconnected {source} -> {dest}");
             source_conns(client, conns, source).remove(dest);
+            true
         }
-        Err(e) => log::warn!("disconnect {source} -> {dest} failed: {e}"),
+        Err(e) => {
+            log::warn!("disconnect {source} -> {dest} failed: {e}");
+            false
+        }
     }
 }
 
