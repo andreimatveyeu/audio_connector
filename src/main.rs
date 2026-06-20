@@ -12,10 +12,10 @@
 mod config;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use regex::Regex;
 use toml::value::{Table, Value};
@@ -169,8 +169,10 @@ fn main() {
         });
     }
 
-    // Initial reconcile on startup, before the first graph event.
-    reconcile(active.as_client(), &settings.config_path);
+    // Initial reconcile on startup, before the first graph event. The reconciler
+    // owns the parsed-config and compiled-regex caches across passes.
+    let mut reconciler = Reconciler::new(settings.config_path);
+    reconciler.reconcile(active.as_client());
 
     // Watch loop: wait -> debounce -> reconcile to a fixpoint.
     loop {
@@ -194,7 +196,7 @@ fn main() {
         // passes never loses state. This is what stops the old unconditional
         // post-cooldown `dirty.clear()` from swallowing real events (a re-linked
         // Firefox -> hardware playback) that landed inside the cooldown window.
-        while reconcile(active.as_client(), &settings.config_path) {
+        while reconciler.reconcile(active.as_client()) {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -211,22 +213,104 @@ fn main() {
     }
 }
 
-/// Load the config and apply the declared connections to the live graph.
+/// Holds the reconcile state that persists across passes: the parsed config
+/// (reloaded only when a source file's mtime changes) and a cache of compiled
+/// regexes (rebuilt only when the config reloads).
 ///
-/// Returns `true` if it changed the graph (made at least one connect or
-/// disconnect), so the caller can keep reconciling until a pass is a no-op.
-fn reconcile(client: &jack::Client, config_path: &std::path::Path) -> bool {
-    log::info!("applying connections from {}", config_path.display());
-    let config = match config::load_config(config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("failed to load config: {e}");
+/// Re-parsing the TOML and recompiling every `regex:` spec on each graph event
+/// was pure churn -- a watcher can fire many events a second while the config
+/// almost never changes -- so both are now memoized.
+struct Reconciler {
+    config_path: PathBuf,
+    config: Option<CachedConfig>,
+    /// Keyed by the compiled regex source; `None` marks a pattern that failed
+    /// to compile, so we warn once rather than on every pass.
+    regex_cache: HashMap<String, Option<Regex>>,
+}
+
+/// A parsed config together with the mtime of every file it was built from.
+struct CachedConfig {
+    table: Table,
+    sources: Vec<(PathBuf, Option<SystemTime>)>,
+}
+
+impl Reconciler {
+    fn new(config_path: PathBuf) -> Self {
+        Self {
+            config_path,
+            config: None,
+            regex_cache: HashMap::new(),
+        }
+    }
+
+    /// Load the config and apply the declared connections to the live graph.
+    ///
+    /// Returns `true` if it changed the graph (made at least one connect or
+    /// disconnect), so the caller can keep reconciling until a pass is a no-op.
+    fn reconcile(&mut self, client: &jack::Client) -> bool {
+        if !self.ensure_loaded() {
             return false;
         }
-    };
-    let changed = apply(client, &config);
-    log::info!("connections applied");
-    changed
+        // Disjoint field borrows: the cached table is read while the regex cache
+        // is mutated. `ensure_loaded` returning true guarantees `config` is Some.
+        let table = match &self.config {
+            Some(c) => &c.table,
+            None => return false,
+        };
+        let changed = apply(client, table, &mut self.regex_cache);
+        log::info!("connections applied");
+        changed
+    }
+
+    /// Ensure `self.config` holds an up-to-date parse, reloading only when a
+    /// source file changed. Returns `false` only when there is no usable config
+    /// at all (the initial load failed); a failed *re*load keeps the last-good
+    /// config so a transient bad edit doesn't tear down live connections.
+    fn ensure_loaded(&mut self) -> bool {
+        let fresh = self
+            .config
+            .as_ref()
+            .is_some_and(|c| sources_unchanged(&c.sources));
+        if fresh {
+            return true;
+        }
+
+        match config::load_config(&self.config_path) {
+            Ok(loaded) => {
+                let sources = loaded
+                    .sources
+                    .into_iter()
+                    .map(|p| {
+                        let m = mtime(&p);
+                        (p, m)
+                    })
+                    .collect();
+                self.config = Some(CachedConfig {
+                    table: loaded.table,
+                    sources,
+                });
+                // Patterns may have changed; drop any stale compiled regexes.
+                self.regex_cache.clear();
+                log::info!("loaded config from {}", self.config_path.display());
+                true
+            }
+            Err(e) => {
+                log::error!("failed to load config: {e}");
+                // Keep serving the last-good config if we have one.
+                self.config.is_some()
+            }
+        }
+    }
+}
+
+/// True if every cached source still has the mtime we recorded, so the parsed
+/// config is still current. A now-missing or unreadable file reads as changed.
+fn sources_unchanged(sources: &[(PathBuf, Option<SystemTime>)]) -> bool {
+    sources.iter().all(|(path, cached)| mtime(path) == *cached)
+}
+
+fn mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 /// Resolve declared edges against current ports and connect/disconnect as needed.
@@ -234,7 +318,11 @@ fn reconcile(client: &jack::Client, config_path: &std::path::Path) -> bool {
 ///   * table key  = source (output) port short-name, optionally `disconnect:`-
 ///     or `regex:`-prefixed;
 ///   * array value = destination (input) port full-names, optionally `regex:`.
-fn apply(client: &jack::Client, config: &Table) -> bool {
+fn apply(
+    client: &jack::Client,
+    config: &Table,
+    regex_cache: &mut HashMap<String, Option<Regex>>,
+) -> bool {
     // Snapshot of every current port name; regex specs match against these.
     let all_ports: Vec<String> = client.ports(None, None, jack::PortFlags::empty());
     let port_set: HashSet<&str> = all_ports.iter().map(String::as_str).collect();
@@ -264,7 +352,13 @@ fn apply(client: &jack::Client, config: &Table) -> bool {
             };
 
             // Resolve the source port(s).
-            let output_ports = resolve_ports(&all_ports, &port_set, output_key, Some(client_name));
+            let output_ports = resolve_ports(
+                &all_ports,
+                &port_set,
+                output_key,
+                Some(client_name),
+                regex_cache,
+            );
             if output_ports.is_empty() {
                 // Normal in a declarative model: clients come and go. Demoted to
                 // debug so a watcher re-running on every graph event stays quiet.
@@ -278,7 +372,7 @@ fn apply(client: &jack::Client, config: &Table) -> bool {
                         log::warn!("non-string destination under '{out}', skipping");
                         continue;
                     };
-                    let input_ports = resolve_ports(&all_ports, &port_set, inp, None);
+                    let input_ports = resolve_ports(&all_ports, &port_set, inp, None, regex_cache);
                     if input_ports.is_empty() {
                         log::debug!("no current port for: {inp}");
                         continue;
@@ -318,6 +412,7 @@ fn resolve_ports(
     port_set: &HashSet<&str>,
     spec: &str,
     client: Option<&str>,
+    regex_cache: &mut HashMap<String, Option<Regex>>,
 ) -> Vec<String> {
     // A `regex:` marker anywhere in the spec selects regex matching; the literal
     // marker is then stripped before compiling the pattern.
@@ -327,12 +422,20 @@ fn resolve_ports(
             Some(c) => format!("{c}:{body}"),
             None => body,
         };
-        let re = match Regex::new(&format!("^(?:{pattern})")) {
-            Ok(re) => re,
-            Err(e) => {
-                log::warn!("invalid regex '{pattern}': {e}");
-                return Vec::new();
-            }
+        // Compile once per distinct pattern and reuse across passes. A compile
+        // failure caches `None` so we warn once, not on every reconcile.
+        let source = format!("^(?:{pattern})");
+        let re = regex_cache
+            .entry(source.clone())
+            .or_insert_with(|| match Regex::new(&source) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    log::warn!("invalid regex '{pattern}': {e}");
+                    None
+                }
+            });
+        let Some(re) = re else {
+            return Vec::new();
         };
         all_ports
             .iter()
@@ -422,7 +525,8 @@ mod tests {
 
     fn resolve(all: &[String], spec: &str, client: Option<&str>) -> Vec<String> {
         let set: HashSet<&str> = all.iter().map(String::as_str).collect();
-        let mut got = resolve_ports(all, &set, spec, client);
+        let mut cache = HashMap::new();
+        let mut got = resolve_ports(all, &set, spec, client, &mut cache);
         got.sort();
         got
     }

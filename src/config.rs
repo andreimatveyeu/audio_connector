@@ -14,12 +14,27 @@ use toml::value::{Table, Value};
 
 const INCLUDE_KEY: &str = "include";
 
-/// Load a config file, resolving any `include` directives recursively.
-pub fn load_config(path: &Path) -> Result<Table, String> {
-    load_file(path, &HashSet::new())
+/// A parsed config together with the canonical paths of every file that fed
+/// into it (the root file and all transitively included ones), so a caller can
+/// cheaply detect when the on-disk config changed and a reload is needed.
+#[derive(Debug)]
+pub struct LoadedConfig {
+    pub table: Table,
+    pub sources: Vec<PathBuf>,
 }
 
-fn load_file(path: &Path, chain: &HashSet<PathBuf>) -> Result<Table, String> {
+/// Load a config file, resolving any `include` directives recursively.
+pub fn load_config(path: &Path) -> Result<LoadedConfig, String> {
+    let mut sources = Vec::new();
+    let table = load_file(path, &HashSet::new(), &mut sources)?;
+    Ok(LoadedConfig { table, sources })
+}
+
+fn load_file(
+    path: &Path,
+    chain: &HashSet<PathBuf>,
+    sources: &mut Vec<PathBuf>,
+) -> Result<Table, String> {
     let abs = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
 
     if chain.contains(&abs) {
@@ -29,6 +44,8 @@ fn load_file(path: &Path, chain: &HashSet<PathBuf>) -> Result<Table, String> {
     // sibling/diamond includes are still allowed.
     let mut next_chain = chain.clone();
     next_chain.insert(abs.clone());
+    // Record every file we actually read, so a watcher can stat them for changes.
+    sources.push(abs.clone());
 
     let text = std::fs::read_to_string(&abs).map_err(|e| format!("{}: {e}", abs.display()))?;
     let mut raw: Table = toml::from_str(&text).map_err(|e| format!("{}: {e}", abs.display()))?;
@@ -59,7 +76,7 @@ fn load_file(path: &Path, chain: &HashSet<PathBuf>) -> Result<Table, String> {
                     base_dir.join(p)
                 }
             };
-            let child = load_file(&inc_path, &next_chain)?;
+            let child = load_file(&inc_path, &next_chain, sources)?;
             merge_table(&mut merged, child);
         }
     }
@@ -137,7 +154,7 @@ mod tests {
             out_left = ["mixer:in_1", "rec:in_1"]
         "#,
         );
-        let cfg = load_config(&p).unwrap();
+        let cfg = load_config(&p).unwrap().table;
         assert_eq!(edges(&cfg, "synth", "out_left"), ["mixer:in_1", "rec:in_1"]);
     }
 
@@ -161,7 +178,7 @@ mod tests {
             out = ["mixer:in_1"]
         "#,
         );
-        let cfg = load_config(&base).unwrap();
+        let cfg = load_config(&base).unwrap().table;
         assert_eq!(edges(&cfg, "synth", "out"), ["mixer:in_1"]);
         assert_eq!(edges(&cfg, "drums", "out"), ["mixer:in_9"]);
         // The `include` directive itself must not survive as a client.
@@ -188,7 +205,7 @@ mod tests {
             main = ["mixer:in_1"]
         "#,
         );
-        let cfg = load_config(&base).unwrap();
+        let cfg = load_config(&base).unwrap().table;
         assert_eq!(edges(&cfg, "synth", "aux"), ["fx:in_1"]);
         assert_eq!(edges(&cfg, "synth", "main"), ["mixer:in_1"]);
     }
@@ -213,7 +230,7 @@ mod tests {
             out = ["a", "b"]
         "#,
         );
-        let cfg = load_config(&base).unwrap();
+        let cfg = load_config(&base).unwrap().table;
         // Included file is the base; the including file's items are appended,
         // with duplicates ("b") dropped.
         assert_eq!(edges(&cfg, "synth", "out"), ["b", "c", "a"]);
@@ -237,7 +254,7 @@ mod tests {
             include = ["sub/child.toml"]
         "#,
         );
-        let cfg = load_config(&base).unwrap();
+        let cfg = load_config(&base).unwrap().table;
         assert_eq!(edges(&cfg, "drums", "out"), ["mixer:in_9"]);
     }
 
