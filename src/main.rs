@@ -406,7 +406,11 @@ fn split_disconnect(key: &str) -> (bool, &str) {
 /// `client` is `Some` for the output (table key) side, where the client name is
 /// prefixed onto the short port name; `None` for the destination side, where the
 /// spec is already a full `client:port` name. A `regex:` prefix switches to
-/// start-anchored regex matching.
+/// start-anchored regex matching. The marker is honoured on either side: a key
+/// (e.g. `regex:capture_.*`) or the client/table-header (e.g.
+/// `["regex:synth(-[0-9]+)?"]`, for clients whose JACK name carries a varying
+/// postfix); when it appears on the client, that side is treated as a regex
+/// sub-pattern rather than a literal prefix.
 fn resolve_ports(
     all_ports: &[String],
     port_set: &HashSet<&str>,
@@ -414,12 +418,13 @@ fn resolve_ports(
     client: Option<&str>,
     regex_cache: &mut HashMap<String, Option<Regex>>,
 ) -> Vec<String> {
-    // A `regex:` marker anywhere in the spec selects regex matching; the literal
-    // marker is then stripped before compiling the pattern.
-    if spec.contains("regex:") {
+    // A `regex:` marker on the key *or* the client selects regex matching; the
+    // literal marker is then stripped from both before compiling the pattern.
+    let client_is_regex = client.is_some_and(|c| c.contains("regex:"));
+    if spec.contains("regex:") || client_is_regex {
         let body = spec.replacen("regex:", "", 1);
         let pattern = match client {
-            Some(c) => format!("{c}:{body}"),
+            Some(c) => format!("{}:{body}", c.replacen("regex:", "", 1)),
             None => body,
         };
         // Compile once per distinct pattern and reuse across passes. A compile
@@ -607,6 +612,27 @@ mod tests {
         assert_eq!(
             resolve(&all, "regex:sys", None),
             ["system:playback_1", "system:playback_2"]
+        );
+    }
+
+    #[test]
+    fn regex_client_matches_optional_postfix() {
+        // A `regex:` marker on the client/table-header treats the client name as
+        // a pattern, so a varying JACK postfix (e.g. "synth-181") still matches.
+        let all = ports(&["synth:left", "synth-181:left", "synthx:left"]);
+        assert_eq!(
+            resolve(&all, "left", Some("regex:synth(-[0-9]+)?")),
+            ["synth-181:left", "synth:left"]
+        );
+    }
+
+    #[test]
+    fn regex_client_with_regex_key() {
+        // Both sides may carry the marker; each is stripped and combined.
+        let all = ports(&["synth-9:left", "synth-9:right", "other:left"]);
+        assert_eq!(
+            resolve(&all, "regex:.*", Some("regex:synth(-[0-9]+)?")),
+            ["synth-9:left", "synth-9:right"]
         );
     }
 
